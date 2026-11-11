@@ -31,13 +31,14 @@ const SHADOW_MARGIN: i32 = 24;
 
 const CATEGORY_ORDER: &[&str] = &[
     "Top Hit", "Calculator", "Conversion", "Clock", "Weather", "Commands", "Websites", "Applications",
-    "System Settings", "Definition", "Wikipedia", "Documents", "Folders", "Files", "Claude",
+    "System Settings", "Slack", "Definition", "Wikipedia", "Documents", "Folders", "Files", "Claude",
     "Web Suggestions", "Search the Web",
 ];
 
 fn category_limit(c: &str) -> usize {
     match c {
         "Applications" | "Documents" => 6,
+        "Slack" => 5,
         "Folders" | "System Settings" | "Commands" | "Web Suggestions" => 4,
         _ => 3,
     }
@@ -110,6 +111,7 @@ fn dark_mode() -> bool {
 enum Msg {
     Results { gen: u64, items: Vec<Item> },
     Image { url: String, bytes: Vec<u8> },
+    ImageFailed { url: String },
     ClaudeDelta { id: u64, text: String },
     ClaudeDone { id: u64, error: Option<String> },
 }
@@ -147,7 +149,7 @@ struct State {
     recent: Arc<HashSet<String>>,
     claude: ClaudeState,
     image_cache: HashMap<String, gdk::Texture>,
-    pending_image: Option<(String, gtk::Picture)>,
+    pending_image: Option<(String, gtk::Picture, &'static str)>, // url, target, fallback icon
 }
 
 struct Ui {
@@ -164,6 +166,7 @@ struct Lumen {
     st: RefCell<State>,
     tx: async_channel::Sender<Msg>,
     files: FileIndex,
+    slack: SlackIndex,
     claude_current: Arc<AtomicU64>,
     css: gtk::CssProvider,
 }
@@ -328,6 +331,7 @@ fn build(app: &gtk::Application) -> L {
         }),
         tx,
         files: start_file_index(),
+        slack: start_slack_index(),
         claude_current: Arc::new(AtomicU64::new(0)),
         css,
     });
@@ -595,6 +599,7 @@ fn on_changed(l: &L) {
         local.extend(app_items(&l.st.borrow(), &ql));
         local.extend(settings_items(&ql));
         local.extend(system_items(&ql));
+        local.extend(slack_items(&l.slack, &q));
     }
     let answered = local.iter().any(|i| matches!(i.category, "Calculator" | "Conversion" | "Clock"));
     if !answered {
@@ -643,11 +648,12 @@ fn on_changed(l: &L) {
 fn handle_msg(l: &L, msg: Msg) {
     match msg {
         Msg::Results { gen, items } => merge(l, items, gen),
+        Msg::ImageFailed { url } => image_fallback(l, &url),
         Msg::Image { url, bytes } => {
-            let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) else { return };
+            let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) else { return image_fallback(l, &url) };
             let mut st = l.st.borrow_mut();
             st.image_cache.insert(url.clone(), tex.clone());
-            if let Some((u, pic)) = &st.pending_image {
+            if let Some((u, pic, _)) = &st.pending_image {
                 if *u == url {
                     pic.set_paintable(Some(&tex));
                 }
@@ -679,6 +685,19 @@ fn handle_msg(l: &L, msg: Msg) {
             }
         }
     }
+}
+
+/// Show the row's icon instead of an empty box when a preview image can't be loaded.
+fn image_fallback(l: &L, url: &str) {
+    let st = l.st.borrow();
+    let Some((u, pic, icon_name)) = &st.pending_image else { return };
+    if u != url {
+        return;
+    }
+    let theme = gtk::IconTheme::for_display(&pic.display());
+    let icon = theme.lookup_icon(icon_name, &[], 96, 1, gtk::TextDirection::None, gtk::IconLookupFlags::empty());
+    pic.set_size_request(96, 96);
+    pic.set_paintable(Some(&icon));
 }
 
 fn merge(l: &L, items: Vec<Item>, gen: u64) {
@@ -932,13 +951,15 @@ fn preview_picture(l: &L, it: &Item) -> gtk::Widget {
         if let Some(tex) = st.image_cache.get(url) {
             pic.set_paintable(Some(tex));
         } else {
-            st.pending_image = Some((url.clone(), pic.clone()));
+            let fallback = if it.key.starts_with("slack:") { "avatar-default" } else { "image-missing" };
+            st.pending_image = Some((url.clone(), pic.clone(), fallback));
             let tx = l.tx.clone();
             let url = url.clone();
             thread::spawn(move || {
-                if let Some(bytes) = get_bytes(&url) {
-                    let _ = tx.send_blocking(Msg::Image { url, bytes });
-                }
+                let _ = match get_bytes(&url) {
+                    Some(bytes) => tx.send_blocking(Msg::Image { url, bytes }),
+                    None => tx.send_blocking(Msg::ImageFailed { url }),
+                };
             });
         }
         return pic.upcast();

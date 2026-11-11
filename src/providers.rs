@@ -135,6 +135,7 @@ pub struct Config {
     pub max_indexed_files: usize,
     pub claude: bool,
     pub claude_model: String,
+    pub slack_tokens: Vec<String>,
 }
 
 pub fn config() -> &'static Config {
@@ -165,6 +166,12 @@ pub fn config() -> &'static Config {
             max_indexed_files: v["max_indexed_files"].as_u64().unwrap_or(400_000) as usize,
             claude: v["claude"].as_bool().unwrap_or(true),
             claude_model: v["claude_model"].as_str().unwrap_or("haiku").to_string(),
+            // "slack_token": "xoxp-..." or "slack_tokens": [...] (one per workspace), or $LUMEN_SLACK_TOKEN
+            slack_tokens: v["slack_token"].as_str().into_iter().map(String::from)
+                .chain(v["slack_tokens"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)))
+                .chain(env::var("LUMEN_SLACK_TOKEN").ok())
+                .filter(|t| t.starts_with("xox"))
+                .collect(),
         }
     })
 }
@@ -912,6 +919,221 @@ pub fn claude_item(q: &str) -> Option<Item> {
         .key("claude");
     it.preview = Preview::new(PreviewKind::App, "Ask Claude", "");
     Some(it)
+}
+
+// ------------------------------------------------------------------ Slack people
+
+#[derive(Clone, Debug)]
+pub struct SlackUser {
+    id: String,
+    team: String,
+    workspace: String,
+    name: String,
+    display: String,
+    username: String,
+    title: String,
+    email: String,
+    tz: String,
+    status: String,
+    avatar: String,
+}
+
+pub type SlackIndex = Arc<RwLock<Vec<SlackUser>>>;
+
+const SLACK_REFRESH_SECS: u64 = 6 * 3600;
+static SLACK_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+fn slack_cache_path() -> PathBuf {
+    cache_dir().join("slack-users.json")
+}
+
+fn slack_user_from_json(v: &Value) -> SlackUser {
+    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
+    SlackUser {
+        id: s("id"), team: s("team"), workspace: s("workspace"), name: s("name"), display: s("display"),
+        username: s("username"), title: s("title"), email: s("email"), tz: s("tz"), status: s("status"),
+        avatar: s("avatar"),
+    }
+}
+
+fn slack_user_to_json(u: &SlackUser) -> Value {
+    serde_json::json!({
+        "id": u.id, "team": u.team, "workspace": u.workspace, "name": u.name, "display": u.display,
+        "username": u.username, "title": u.title, "email": u.email, "tz": u.tz, "status": u.status,
+        "avatar": u.avatar,
+    })
+}
+
+/// Loads the cached directory right away, then refreshes it from Slack every 6 hours.
+pub fn start_slack_index() -> SlackIndex {
+    let index: SlackIndex = Arc::new(RwLock::new(Vec::new()));
+    let cached = fs::read_to_string(slack_cache_path()).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let mut cache_age = u64::MAX;
+    if let Some(c) = &cached {
+        let users: Vec<SlackUser> = c["users"].as_array().into_iter().flatten().map(slack_user_from_json).collect();
+        *index.write().unwrap() = users;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        cache_age = now.saturating_sub(c["ts"].as_u64().unwrap_or(0));
+    }
+    if config().slack_tokens.is_empty() {
+        return index;
+    }
+    let idx = index.clone();
+    thread::spawn(move || {
+        if cache_age < SLACK_REFRESH_SECS {
+            thread::sleep(Duration::from_secs(SLACK_REFRESH_SECS - cache_age));
+        }
+        loop {
+            refresh_slack(&idx);
+            thread::sleep(Duration::from_secs(SLACK_REFRESH_SECS));
+        }
+    });
+    index
+}
+
+fn slack_get(token: &str, method: &str, query: &str) -> Option<Value> {
+    let url = format!("https://slack.com/api/{method}?{query}");
+    let s = agent().get(&url).set("Authorization", &format!("Bearer {token}")).call().ok()?.into_string().ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    if v["ok"].as_bool() != Some(true) {
+        let err = v["error"].as_str().unwrap_or("unknown error").to_string();
+        eprintln!("lumen: Slack {method} failed: {err}");
+        *SLACK_ERROR.lock().unwrap() = Some(match err.as_str() {
+            "invalid_auth" | "not_authed" | "token_revoked" | "account_inactive" => "Slack token was rejected".into(),
+            "missing_scope" => "Slack token needs the users:read scope".into(),
+            _ => format!("Slack error: {err}"),
+        });
+        return None;
+    }
+    Some(v)
+}
+
+fn refresh_slack(index: &SlackIndex) {
+    let mut users = Vec::new();
+    for token in &config().slack_tokens {
+        let Some(auth) = slack_get(token, "auth.test", "") else { continue };
+        let team = auth["team_id"].as_str().unwrap_or("").to_string();
+        let workspace = auth["team"].as_str().unwrap_or("").to_string();
+        let mut cursor = String::new();
+        loop {
+            let q = format!("limit=200&cursor={}", urlencoding::encode(&cursor));
+            let Some(page) = slack_get(token, "users.list", &q) else { break };
+            for m in page["members"].as_array().into_iter().flatten() {
+                if m["deleted"].as_bool() == Some(true) || m["is_bot"].as_bool() == Some(true) || m["id"] == "USLACKBOT" {
+                    continue;
+                }
+                let p = &m["profile"];
+                let s = |v: &Value| v.as_str().unwrap_or("").to_string();
+                let status = format!("{} {}", s(&p["status_emoji"]), s(&p["status_text"])).trim().to_string();
+                users.push(SlackUser {
+                    id: s(&m["id"]),
+                    team: team.clone(),
+                    workspace: workspace.clone(),
+                    name: { let n = s(&p["real_name"]); if n.is_empty() { s(&m["name"]) } else { n } },
+                    display: s(&p["display_name"]),
+                    username: s(&m["name"]),
+                    title: s(&p["title"]),
+                    email: s(&p["email"]),
+                    tz: s(&m["tz"]),
+                    status: if status.starts_with(':') && !status.contains(' ') { String::new() } else { status },
+                    avatar: s(&p["image_192"]),
+                });
+            }
+            cursor = page["response_metadata"]["next_cursor"].as_str().unwrap_or("").to_string();
+            if cursor.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1500)); // users.list is rate limited (~20 calls/min)
+        }
+    }
+    if users.is_empty() {
+        return; // keep the old directory if Slack was unreachable
+    }
+    *SLACK_ERROR.lock().unwrap() = None;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let json = serde_json::json!({"ts": now, "users": users.iter().map(slack_user_to_json).collect::<Vec<_>>()});
+    let path = slack_cache_path();
+    if fs::write(&path, json.to_string()).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)); // names and emails
+    }
+    *index.write().unwrap() = users;
+}
+
+pub fn slack_items(index: &SlackIndex, q: &str) -> Vec<Item> {
+    let lower = q.trim().to_lowercase();
+    let (ql, explicit) = match lower.strip_prefix("slack ").or_else(|| lower.strip_prefix("@")) {
+        Some(rest) => (rest.trim().to_string(), true),
+        None => (lower.clone(), false),
+    };
+    if ql.len() < 2 {
+        return vec![];
+    }
+    let users = index.read().unwrap();
+    if users.is_empty() {
+        if !explicit {
+            return vec![];
+        }
+        let msg = if config().slack_tokens.is_empty() {
+            "Add a Slack token to search people".to_string()
+        } else {
+            SLACK_ERROR.lock().unwrap().clone().unwrap_or_else(|| "Loading your Slack directory…".into())
+        };
+        return vec![Item::new(msg, "Press Enter for setup steps", icon("dialog-information"), "Slack", 60.0,
+                              Action::OpenUri("https://github.com/sharmaniraj009/lumen#slack-people-search".into()))
+            .key("slack:setup")];
+    }
+    let mut hits: Vec<(f64, &SlackUser)> = users
+        .iter()
+        .filter_map(|u| {
+            let s = text_score(&ql, &u.name, false)
+                .max(text_score(&ql, &u.display, false))
+                .max(text_score(&ql, &u.username, false) * 0.9)
+                .max(text_score(&ql, u.email.split('@').next().unwrap_or(""), false) * 0.8);
+            (s >= 60.0).then_some((s, u))
+        })
+        .collect();
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    let multi = config().slack_tokens.len() > 1;
+    hits.into_iter()
+        .take(5)
+        .map(|(s, u)| {
+            let handle = if u.display.is_empty() { &u.username } else { &u.display };
+            let mut sub = format!("@{handle}");
+            if !u.title.is_empty() {
+                sub.push_str(&format!(" · {}", u.title));
+            }
+            if multi && !u.workspace.is_empty() {
+                sub.push_str(&format!(" · {}", u.workspace));
+            }
+            let local_time = u.tz.parse::<chrono_tz::Tz>().ok().map(|tz| Utc::now().with_timezone(&tz).format("%-I:%M %p").to_string());
+            let mut pv = Preview::new(PreviewKind::Web, u.name.clone(), u.title.clone());
+            pv.image_url = (!u.avatar.is_empty()).then(|| u.avatar.clone());
+            pv.meta.push(("Slack".into(), format!("@{handle}")));
+            if !u.status.is_empty() {
+                pv.meta.push(("Status".into(), u.status.clone()));
+            }
+            if let Some(t) = local_time {
+                pv.meta.push(("Local time".into(), format!("{t} ({})", u.tz)));
+            }
+            if !u.email.is_empty() {
+                pv.meta.push(("Email".into(), u.email.clone()));
+            }
+            if !u.workspace.is_empty() {
+                pv.meta.push(("Workspace".into(), u.workspace.clone()));
+            }
+            pv.meta.push(("Keys".into(), "↵ message in Slack · Ctrl+↵ copy email".into()));
+            let mut it = Item::new(u.name.clone(), sub, icon("avatar-default"), "Slack",
+                                   s * 0.9 + if explicit { 40.0 } else { 0.0 },
+                                   Action::OpenUri(format!("slack://user?team={}&id={}", u.team, u.id)))
+                .key(format!("slack:{}", u.id))
+                .preview(pv);
+            if !u.email.is_empty() {
+                it.alt = Some(Action::Copy(u.email.clone()));
+            }
+            it
+        })
+        .collect()
 }
 
 pub type Provider = fn(&str) -> Vec<Item>;
